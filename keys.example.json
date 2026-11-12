@@ -1,0 +1,5 @@
+{
+  "alice-laptop": { "key": "gw_example_0000000000000000000000000001", "rpm": 20 },
+  "ci-bot": { "key": "gw_example_0000000000000000000000000002", "rpm": 5 },
+  "web-ask": { "key": "gw_example_0000000000000000000000000003", "rpm": 5, "scope": "ask" }
+}
