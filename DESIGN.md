@@ -62,10 +62,10 @@ The default log is metadata only. Prompt and reply text are written only if `CON
 
 - Sessions and rate-limit counters live in process memory. A restart drops every conversation and resets all limits. That is fine for a chat box and wrong for billing-grade metering.
 - The rate-limit map is never pruned of idle names. It is keyed by key name and by visitor IP, so it grows with distinct IPs until restart. At this traffic it is small, but it is unbounded in principle. Sessions are capped at 200 with oldest-first eviction.
-- No auto-start. Nothing supervises the process. If it exits or the machine reboots, the gateway and the tunnel stay down until someone starts them, and the chat box shows its offline error.
+- No supervision in this repo. The gateway does not restart itself. In the original deployment a separate watchdog script (scheduled at logon) polls `/health`, the tunnel hostname and Ollama, and restarts what is down; it is host-specific and not included here.
 - The queue has no wait timeout and does not notice client disconnects. A caller that gives up still has its job run when its turn comes.
 - Key comparison is a plain string match, not constant-time, and the keys file is read and parsed on every request. Fine for a few keys behind a rate limit; not a design for many.
 - The model allowlist applies to POST bodies. `GET /v1/models` is passed through and lists whatever the Ollama host has installed.
 - Streaming is disabled, so a caller sees nothing until the full completion is ready.
-- One process, one GPU, one host. No failover, health endpoint, or metrics beyond the log.
+- One process, one GPU, one host. `/health` is liveness only. `/ask` can fail over from `ASK_MODEL` to an optional `ASK_FALLBACK_MODEL` (30 s primary timeout, one GPU slot held across both attempts), but the fallback is untested against the eval set and off by default. There are no metrics beyond the log.
 - Testing is manual. The run described in the README covers only the auth and validation paths.

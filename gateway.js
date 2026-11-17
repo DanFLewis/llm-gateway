@@ -21,6 +21,26 @@ const ASK_PROMPT = path.join(ASK_DIR, 'system_prompt.txt'), ASK_FACTS = path.joi
 const crypto = require('crypto');
 const ASK_CTX = 8192, MAX_TURNS = 4, SESSION_TTL = 30 * 60000, MAX_SESSIONS = 200;
 const sessions = new Map();   // id -> { turns:[{q,a}], last, ip, n }  (memory only)
+const ASK_FALLBACK = process.env.ASK_FALLBACK_MODEL || '';   // e.g. qwen3.5:9b; empty = no failover
+const PRIMARY_TIMEOUT = Number(process.env.PRIMARY_TIMEOUT_MS) || 30000;   // give up on the primary sooner when a fallback exists
+const KEEP_ALIVE = process.env.KEEP_ALIVE || '30m';
+// One native /api/chat call. Resolves {a, extra}; a is null on any failure (HTTP error, timeout, empty reply).
+const askOllama = (model, msgs, timeout) => new Promise((resolve) => {
+  const payload = Buffer.from(JSON.stringify({ model, stream: false, think: false, keep_alive: KEEP_ALIVE,
+    options: { num_ctx: ASK_CTX, temperature: 0.1, num_predict: 200 }, messages: msgs }));
+  const up = http.request({ ...OLLAMA, path: '/api/chat', method: 'POST', timeout,
+    headers: { 'Content-Type': 'application/json', 'Content-Length': payload.length } }, (ur) => {
+    const out = []; ur.on('data', (c) => out.push(c));
+    ur.on('end', () => {
+      let a = null, extra = { model };
+      try { const j = JSON.parse(Buffer.concat(out).toString('utf8')); a = ur.statusCode === 200 && j.message && j.message.content && j.message.content.trim() || null; extra = { model: j.model || model, in: j.prompt_eval_count, out: j.eval_count }; } catch {}
+      resolve({ a, extra });
+    });
+  });
+  up.on('timeout', () => up.destroy(new Error('timeout')));
+  up.on('error', () => resolve({ a: null, extra: { model, err: 1 } }));
+  up.end(payload);
+});
 const keysFile = process.env.KEYS_FILE || path.join(__dirname, 'keys.json');
 const logFile = process.env.LOG_FILE || path.join(__dirname, 'gateway.log');
 const convFile = process.env.CONVERSATION_LOG || '';   // full prompt + reply text; private; empty = disabled
@@ -54,6 +74,7 @@ http.createServer(async (req, res) => {
   };
   try {
     const url = req.url.split('?')[0];
+    if (url === '/health' && req.method === 'GET') return send(res, 200, { ok: true });   // liveness only, no model or key info; used by the watchdog through the tunnel
     if (url === '/ask') {   // fixed-prompt "about me" route; off unless ASK_ENABLED=1; needs a key with scope "ask"
       if (!ASK_ENABLED || req.method !== 'POST') { done(404); return send(res, 404, { error: 'not found' }); }
       const am = /^Bearer (.+)$/.exec(h.authorization || '');
@@ -88,23 +109,19 @@ http.createServer(async (req, res) => {
       const msgs = [{ role: 'system', content: sys }];
       for (const t of hist) msgs.push({ role: 'user', content: t.q }, { role: 'assistant', content: t.a });
       msgs.push({ role: 'user', content: q });
-      const payload = Buffer.from(JSON.stringify({ model: ASK_MODEL, stream: false, think: false, keep_alive: '5m',
-        options: { num_ctx: ASK_CTX, temperature: 0.1, num_predict: 200 }, messages: msgs }));
-      const up = http.request({ ...OLLAMA, path: '/api/chat', method: 'POST', timeout: UPSTREAM_TIMEOUT,
-        headers: { 'Content-Type': 'application/json', 'Content-Length': payload.length } }, (ur) => {
-        const out = []; ur.on('data', (c) => out.push(c));
-        ur.on('end', () => {
-          release(); let a = null, extra = {};
-          try { const j = JSON.parse(Buffer.concat(out).toString('utf8')); a = j.message && j.message.content && j.message.content.trim(); extra = { model: j.model, in: j.prompt_eval_count, out: j.eval_count, hist: hist.length, dropped }; } catch {}
-          if (ur.statusCode !== 200 || !a) { done(502, extra); return send(res, 502, { error: 'model server unavailable' }); }
-          sess.turns.push({ q, a }); sess.turns = sess.turns.slice(-MAX_TURNS); sess.last = Date.now(); sess.n++;
-          rec = { messages: [{ role: 'user', content: q }], reply: a, session: sid, turn: sess.n };
-          done(200, extra); send(res, 200, { answer: a, session_id: sid });
-        });
-      });
-      up.on('timeout', () => up.destroy(new Error('timeout')));
-      up.on('error', () => { release(); if (!res.headersSent) send(res, 502, { error: 'model server unavailable' }); done(502); });
-      up.end(payload); return;
+      // try the primary model, then the optional fallback; one GPU slot is held across both attempts
+      const models = [ASK_MODEL].concat(ASK_FALLBACK ? [ASK_FALLBACK] : []);
+      let a = null, extra = {}, usedModel = null;
+      for (let i = 0; i < models.length && !a; i++) {
+        const r = await askOllama(models[i], msgs, i === 0 && models.length > 1 ? PRIMARY_TIMEOUT : UPSTREAM_TIMEOUT);
+        extra = { ...r.extra, hist: hist.length, dropped, tried: i + 1 };
+        if (r.a) { a = r.a; usedModel = models[i]; }
+      }
+      release();
+      if (!a) { done(502, extra); return send(res, 502, { error: 'model server unavailable' }); }
+      sess.turns.push({ q, a }); sess.turns = sess.turns.slice(-MAX_TURNS); sess.last = Date.now(); sess.n++;
+      rec = { messages: [{ role: 'user', content: q }], reply: a, session: sid, turn: sess.n };
+      done(200, { ...extra, model: usedModel }); send(res, 200, { answer: a, session_id: sid }); return;
     }
     if (!ALLOWED_PATHS.has(url)) { done(404); return send(res, 404, { error: 'not found' }); }
     const m = /^Bearer (.+)$/.exec(req.headers.authorization || '');
@@ -143,3 +160,10 @@ http.createServer(async (req, res) => {
     up.end(body);
   } catch (e) { done(500); if (!res.headersSent) send(res, 500, { error: 'internal error' }); }
 }).listen(PORT, '127.0.0.1', () => console.log(`gateway on 127.0.0.1:${PORT}`));
+
+// keep the primary model resident so a visitor does not pay the cold load (10-15 s observed)
+if (ASK_ENABLED && process.env.KEEP_WARM !== '0') setInterval(() => {
+  const r = http.request({ ...OLLAMA, path: '/api/generate', method: 'POST', timeout: 20000, headers: { 'Content-Type': 'application/json' } }, (x) => x.resume());
+  r.on('error', () => {}); r.on('timeout', () => r.destroy());
+  r.end(JSON.stringify({ model: ASK_MODEL, keep_alive: KEEP_ALIVE, prompt: '' }));
+}, 4 * 60000).unref();
